@@ -1,8 +1,9 @@
 import torch
 from torch import nn
 
-import modules.attentions as attentions
-from modules.modules import AdainResBlk1d, ConditionalLayerNorm
+from modules.attention.transformer import ConditionalEncoder
+from modules.cfm.cfm_euler import CFMDecoder
+from modules.modules import AdainResBlk1d, ResnetBlock1D
 
 
 class ConditionalEmbedding(nn.Module):
@@ -10,7 +11,11 @@ class ConditionalEmbedding(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=d_model)
         self.adain = AdainResBlk1d(
-            dim_in=d_model, dim_out=d_model, style_dim=style_dim, kernel_size=3
+            dim_in=d_model,
+            dim_out=d_model,
+            style_dim=style_dim,
+            kernel_size=3,
+            actv=nn.SiLU(),
         )
 
     def forward(self, x, x_mask, utt_emb):
@@ -30,7 +35,6 @@ class AuxDecoder(nn.Module):
         n_heads,
         dim_head=None,
         p_dropout=0.0,
-        utt_emb_dim=0,
     ):
         super().__init__()
 
@@ -41,21 +45,22 @@ class AuxDecoder(nn.Module):
             hidden_channels, hidden_channels, kernel_size=3, padding=1
         )
 
-        self.aux_decoder = attentions.Encoder(
+        # encoder
+        self.aux_decoder = ConditionalEncoder(
             hidden_channels=hidden_channels,
             filter_channels=hidden_channels * 4,
             n_heads=n_heads,
-            n_layers=n_layers,
-            kernel_size=kernel_size,
             dim_head=dim_head,
-            utt_emb_dim=utt_emb_dim,
+            n_layers=n_layers,
             p_dropout=p_dropout,
             causal_ffn=True,
+            norm_type="rmsnorm",
+            use_final_norm=True,
         )
 
         self.proj = nn.Conv1d(hidden_channels, output_channels, 1)
 
-    def forward(self, x, x_mask, aux, cond, cond_mask, utt_emb):
+    def forward(self, x, x_mask, aux, cond, cond_mask):
         # detach x
         x = torch.detach(x)
 
@@ -64,7 +69,7 @@ class AuxDecoder(nn.Module):
         x = self.prenet(x) * x_mask
 
         # attention
-        x = self.aux_decoder(x, x_mask, cond, cond_mask, utt_emb)
+        x = self.aux_decoder(x, x_mask, cond, cond_mask)
 
         # out projection
         x = self.proj(x) * x_mask
@@ -72,86 +77,95 @@ class AuxDecoder(nn.Module):
         return x * x_mask
 
 
-class VarianceDecoder(nn.Module):
+class VariancePredictorCFM(nn.Module):
     def __init__(
         self,
-        input_channels,
-        hidden_channels,
-        output_channels,
-        kernel_size=3,
-        n_layers=2,
-        n_blocks=2,
-        p_dropout=0.1,
-        utt_emb_dim=0,
+        hidden_channels: int = 192,
+        estimator_params={},
     ):
         """
-        Initialize variance encoder module.
+        Initialize variance predictor module.
 
-        Args:
-            input_channels (int): Number of input channels.
-            hidden_channels (int): Number of hidden channels.
-            output_channels (int): Number of output channels.
-            kernel_size (int): Kernel size of convolution layers.
-            n_layers (int): Number of layers.
-            n_blocks (int): Number of blocks.
-            p_dropout (float): Dropout probability.
-            utt_emb_dim (int): Dimension of utterance embedding.
         """
         super().__init__()
 
-        # prenet
-        layers = []
-        for _ in range(n_blocks):
-            for _ in range(n_layers):
-                layers.append(
-                    nn.ModuleList(
-                        [
-                            torch.nn.Conv1d(
-                                input_channels,
-                                hidden_channels,
-                                kernel_size,
-                                padding=(kernel_size - 1) // 2,
-                            ),
-                            nn.LeakyReLU(0.2),
-                            ConditionalLayerNorm(
-                                hidden_channels, utt_emb_dim, epsilon=1e-6
-                            ),
-                            nn.Dropout(p_dropout),
-                        ]
-                    )
-                )
-                input_channels = hidden_channels
-
-            layers.append(
-                nn.GRU(
-                    hidden_channels,
-                    hidden_channels,
-                    num_layers=1,
-                    batch_first=True,
-                    bidirectional=True,
-                )
-            )
-
-        self.layers = nn.ModuleList(layers)
-
-        self.proj = nn.Sequential(
-            nn.Conv1d(hidden_channels, output_channels, 1),
-            nn.InstanceNorm1d(output_channels, affine=True),
+        self.aux_prenet = nn.Conv1d(1, hidden_channels, kernel_size=3, padding=1)
+        self.prenet = nn.Conv1d(
+            hidden_channels, hidden_channels, kernel_size=3, padding=1
         )
 
-    def forward(self, x, x_mask=None, utt_emb=None):
-        # attention mask
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        # aux conv
+        self.aux_embedding = ResnetBlock1D(
+            dim_in=1,
+            dim_out=hidden_channels,
+            utt_emb_dim=hidden_channels,
+            norm_type="adarmsnorm",
+        )
 
-        for layer in self.layers:
-            if isinstance(layer, attentions.MultiHeadAttention):
-                x = layer(x, x, attn_mask=attn_mask) + x
-            else:
-                conv, act, norm, drop = layer
-                x = conv(x) * x_mask  # (B, C, Tmax)
-                x = act(x)
-                x = norm(x, utt_emb)
-                x = drop(x)
+        # decoder
+        self.decoder = CFMDecoder(
+            in_channels=estimator_params["in_channels"] + hidden_channels,
+            hidden_channels=estimator_params["hidden_channels"],
+            out_channels=estimator_params["out_channels"],
+            filter_channels=estimator_params["filter_channels"],
+            n_heads=estimator_params["n_heads"],
+            dim_head=estimator_params["dim_head"],
+            n_layers=estimator_params["n_layers"],
+            kernel_size=estimator_params["kernel_size"],
+            p_dropout=estimator_params["dropout"],
+        )
 
-        x = self.proj(x * x_mask)
-        return x * x_mask
+    def forward(self, x, x_mask, cond, cond_mask, aux_target):
+        x = x.detach()
+
+        # prenets
+        x = x + self.aux_prenet(aux_target) * x_mask
+        x = self.prenet(x) * x_mask
+
+        # Compute loss of score-based decoder
+        diff_loss, _ = self.decoder.compute_loss(
+            aux_target,
+            x_mask,
+            x,
+            c=None,
+            cond=cond,
+            cond_mask=cond_mask,
+        )
+
+        cond_mean = torch.mean(cond, dim=2)
+        aux_embedding = self.aux_embedding(aux_target, x_mask, cond_mean)
+
+        return diff_loss, aux_embedding
+
+    @torch.no_grad()
+    def inference(
+        self,
+        x,
+        x_mask,
+        aux_source,
+        cond,
+        cond_mask,
+        n_timesteps=2,
+        temperature=1.0,
+        solver="euler",
+    ):
+        # prenets
+        x = x + self.aux_prenet(aux_source) * x_mask
+        x = self.prenet(x) * x_mask
+
+        # decoder
+        aux_pred = self.decoder.forward(
+            x,
+            x_mask,
+            n_timesteps,
+            temperature=temperature,
+            c=None,
+            cond=cond,
+            cond_mask=cond_mask,
+            solver=solver,
+        )
+
+        cond_mean = torch.mean(cond, dim=2)
+        aux_embedding = self.aux_embedding(aux_pred, x_mask, cond_mean)
+
+        return aux_embedding

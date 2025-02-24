@@ -6,19 +6,15 @@ from functools import wraps
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
 from packaging import version
 from torch import einsum, nn
 
+from modules.attention.multihead import MultiHeadAttention
+from modules.modules import Conv1dGLU
 
-def exists(x):
-    return x is not None
 
-
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if callable(d) else d
+def exists(val):
+    return val is not None
 
 
 def once(fn):
@@ -148,7 +144,7 @@ class Attend(nn.Module):
         # key padding mask
 
         if exists(mask):
-            mask = rearrange(mask, "b j -> b 1 1 j")
+            mask = rearrange(mask, "b 1 j -> b 1 1 j")
             sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
 
         # causal mask
@@ -169,8 +165,10 @@ class Attend(nn.Module):
         return out
 
 
-def Sequential(*mods):
-    return nn.Sequential(*filter(exists, mods))
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
 
 
 class RMSNorm(nn.Module):
@@ -187,69 +185,74 @@ class RMSNorm(nn.Module):
         return out
 
 
-class CausalConv1d(nn.Conv1d):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        (kernel_size,) = self.kernel_size
-        (dilation,) = self.dilation
-        (stride,) = self.stride
-
-        assert stride == 1
-        self.causal_padding = dilation * (kernel_size - 1)
-
-    def forward(self, x):
-        causal_padded_x = F.pad(x, (self.causal_padding, 0), value=0.0)
-        return super().forward(causal_padded_x)
-
-
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gate = x.chunk(2, dim=-1)
         return F.gelu(gate) * x
 
 
-def FeedForward(dim, mult=4, causal_conv=False):
-    dim_inner = int(dim * mult * 2 / 3)
-
-    conv = None
-    if causal_conv:
-        conv = nn.Sequential(
-            Rearrange("b n d -> b d n"),
-            CausalConv1d(dim_inner, dim_inner, 3),
-            Rearrange("b d n -> b n d"),
-        )
-
-    return Sequential(
-        nn.Linear(dim, dim_inner * 2), GEGLU(), conv, nn.Linear(dim_inner, dim)
+def FeedForward(dim, mult=4):
+    dim_inner = dim * mult
+    return nn.Sequential(
+        RMSNorm(dim),
+        nn.Linear(dim, dim_inner * 2),
+        GEGLU(),
+        nn.Linear(dim_inner, dim),
     )
 
 
 class PerceiverResampler(nn.Module):
     def __init__(
         self,
+        in_channels,
         hidden_channels,
-        depth=2,
+        n_layers=2,
         num_latents=32,
+        n_heads=8,
         dim_head=64,
-        heads=8,
         ff_mult=4,
+        p_dropout=0.1,
     ):
         super().__init__()
 
-        # latents
-        self.num_latents = num_latents
+        # spectral
+        self.spectral = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_channels, 1),
+            nn.Mish(),
+            nn.Dropout(p_dropout),
+            nn.Conv1d(hidden_channels, hidden_channels, 1),
+            nn.Mish(),
+            nn.Dropout(p_dropout),
+        )
+
+        # temporal
+        self.temporal = nn.Sequential(
+            Conv1dGLU(hidden_channels, hidden_channels, 5, p_dropout),
+            Conv1dGLU(hidden_channels, hidden_channels, 5, p_dropout),
+        )
+
+        # self attention
+        self.attn = MultiHeadAttention(
+            hidden_channels,
+            hidden_channels,
+            n_heads=n_heads,
+            dim_head=dim_head,
+            p_dropout=p_dropout,
+        )
+
+        # latent encoder
         self.latents = nn.Parameter(torch.randn(num_latents, hidden_channels))
         nn.init.normal_(self.latents, std=0.02)
 
         self.layers = nn.ModuleList([])
-        for _ in range(depth):
+        for _ in range(n_layers):
             self.layers.append(
                 nn.ModuleList(
                     [
                         Attention(
                             dim=hidden_channels,
                             dim_head=dim_head,
-                            heads=heads,
+                            heads=n_heads,
                             use_flash=False,
                             cross_attn_include_queries=True,
                         ),
@@ -263,28 +266,30 @@ class PerceiverResampler(nn.Module):
     def forward(self, x, x_mask):
         batch = x.shape[0]
 
-        # rearrange for perceiver
+        # spectral & temporal
+        x = self.spectral(x) * x_mask
+        x = self.temporal(x) * x_mask
+
+        # self attn
+        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        x = self.attn(x, c=x, attn_mask=attn_mask) + x
+
         x = rearrange(x, "b d n -> b n d")
 
+        # latents
         latents = repeat(self.latents, "n d -> b n d", b=batch)
-        # latents mask
         latents_mask = torch.ones(
-            x.size(0),
-            1,
-            self.num_latents,
-            dtype=x_mask.dtype,
-            device=x_mask.device,
+            batch, 1, latents.shape[1], device=x.device, dtype=x.dtype
         )
 
-        # construct mask to pad
-        x_mask = torch.cat([latents_mask, x_mask], dim=-1).squeeze(1).bool()
-
+        # latent encoder
+        conds_mask = torch.cat([latents_mask, x_mask], dim=-1).bool()
         for attn, ff in self.layers:
-            latents = attn(latents, x, mask=x_mask) + latents
+            latents = attn(latents, x, mask=conds_mask) + latents
             latents = ff(latents) + latents
 
+        # norm
         latents = self.norm(latents)
-
         latents = rearrange(latents, "b n d -> b d n")
 
         return latents, latents_mask
@@ -311,6 +316,10 @@ class Attention(nn.Module):
         dim_inner = dim_head * heads
         dim_context = default(dim_context, dim)
 
+        # norm
+        self.norm_q = RMSNorm(dim)
+        self.norm_kv = RMSNorm(dim_context)
+
         self.attend = Attend(causal=causal, dropout=dropout, use_flash=use_flash)
         self.to_q = nn.Linear(dim, dim_inner, bias=False)
         self.to_kv = nn.Linear(dim_context, dim_inner * 2, bias=False)
@@ -320,6 +329,10 @@ class Attention(nn.Module):
         h, has_context = self.heads, exists(context)
 
         context = default(context, x)
+
+        # norm
+        x = self.norm_q(x)
+        context = self.norm_kv(context)
 
         if has_context and self.cross_attn_include_queries:
             context = torch.cat((x, context), dim=-2)

@@ -21,7 +21,9 @@ class FCPEF0Predictor(F0Predictor):
         threshold=0.05,
     ):
         self.fcpe = FCPEInfer(
-            model_path="/workspace/pretrained_models/fcpe_c_v001.pt", device=device, dtype=dtype
+            model_path="/workspace/pretrained_models/fcpe_c_v001.pt",
+            device=device,
+            dtype=dtype,
         )
         self.hop_length = hop_length
         self.f0_min = f0_min

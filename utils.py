@@ -18,7 +18,7 @@ from scipy.io.wavfile import read
 from sklearn.cluster import MiniBatchKMeans
 from torch.nn import functional as F
 
-from modules.mel_processing import mel_spectrogram_torch
+from modules.mel_processing import mel_spectrogram_torch, spectral_de_normalize_torch
 
 MATPLOTLIB_FLAG = False
 
@@ -140,9 +140,9 @@ def audio_to_energy(
 
 
 def mel_to_energy(mel):
-    avg_energy = torch.mean(mel, dim=1)
-    avg_energy = (avg_energy + 20.0) / 20.0
-    return avg_energy
+    mel = spectral_de_normalize_torch(mel)
+    avg_power = torch.mean(mel, dim=1)
+    return avg_power
 
 
 def compute_energy(

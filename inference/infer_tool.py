@@ -1,6 +1,5 @@
 import gc
 import hashlib
-import io
 import json
 import logging
 import os
@@ -9,8 +8,6 @@ from pathlib import Path
 
 import librosa
 import numpy as np
-
-# import onnxruntime
 import soundfile
 import torch
 import torchaudio
@@ -198,6 +195,7 @@ class Svc(object):
                 device=self.dev,
                 threshold=cr_threshold,
             )
+
         f0, uv = self.f0_predictor_object.compute_f0_uv(wav)
 
         if f0_filter and sum(f0) == 0:
@@ -263,22 +261,6 @@ class Svc(object):
         # resample to target sample rate
         wav = self.audio_resample_transform(wav).squeeze(0)
 
-        # energy
-        energy = (
-            audio_to_energy(
-                wav.unsqueeze(0),
-                self.hps_ms.data.filter_length,
-                self.hps_ms.data.n_mel_channels,
-                self.hps_ms.data.sampling_rate,
-                self.hps_ms.data.hop_length,
-                self.hps_ms.data.win_length,
-                self.hps_ms.data.mel_fmin,
-                self.hps_ms.data.mel_fmax,
-            )
-            .unsqueeze(0)
-            .to(self.dev)
-        )
-
         wav = wav.numpy()
 
         # get the root path of the file
@@ -315,9 +297,7 @@ class Svc(object):
             mel_lengths.append(torch.LongTensor([mel_spec_tgt.shape[2]]).to(self.dev))
 
         # compute cond latent and speaker embedding
-        speaker_embedding, cond, cond_mask = self.net_g_ms.compute_conditional_latent(
-            mels, mel_lengths
-        )
+        cond, cond_mask = self.net_g_ms.compute_conditional_latent(mels, mel_lengths)
 
         # get contentvec, f0, uv and energy
         c, f0, uv = self.get_unit_f0(
@@ -341,8 +321,6 @@ class Svc(object):
                 cond_mask=cond_mask,
                 f0=f0,
                 uv=uv,
-                energy=energy,
-                g=speaker_embedding,
                 n_timesteps=n_timesteps,
                 temperature=temperature,
                 guidance_scale=guidance_scale,

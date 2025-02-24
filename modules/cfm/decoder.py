@@ -6,29 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
 from einops import pack, rearrange
-
-import modules.attentions as attentions
-from modules.cfm.transformer import BasicTransformerBlock
-
-
-class ConditionalGroupNorm(nn.Module):
-    def __init__(self, groups, normalized_shape, context_dim):
-        super().__init__()
-        self.norm = nn.GroupNorm(groups, normalized_shape, affine=False)
-        self.context_mlp = nn.Sequential(
-            nn.SiLU(), nn.Linear(context_dim, 2 * normalized_shape)
-        )
-        self.context_mlp[1].weight.data.zero_()
-        self.context_mlp[1].bias.data.zero_()
-
-    def forward(self, x, context):
-        context = self.context_mlp(context)
-        ndims = " 1" * len(x.shape[2:])
-        context = rearrange(context, f"b c -> b c{ndims}")
-
-        scale, shift = context.chunk(2, dim=1)
-        x = self.norm(x) * (scale + 1.0) + shift
-        return x
+from layers.cfm.transformers import BasicTransformerBlock
+from modules import Block1D
 
 
 class SinusoidalPosEmb(torch.nn.Module):
@@ -49,35 +28,21 @@ class SinusoidalPosEmb(torch.nn.Module):
         return emb
 
 
-class Block1D(torch.nn.Module):
-    def __init__(self, dim, dim_out, groups=8, context_dim=None):
-        super().__init__()
-        self.conv1d = torch.nn.Conv1d(dim, dim_out, 3, padding=1)
-        if context_dim is None:
-            self.norm = torch.nn.GroupNorm(groups, dim_out)
-        else:
-            self.norm = ConditionalGroupNorm(groups, dim_out, context_dim)
-        self.mish = nn.Mish()
-
-    def forward(self, x, mask, utt_emb=None):
-        output = self.conv1d(x * mask)
-        if utt_emb is not None:
-            output = self.norm(output, utt_emb)
-        else:
-            output = self.norm(output)
-        output = self.mish(output)
-        return output * mask
-
-
 class ResnetBlock1D(torch.nn.Module):
-    def __init__(self, dim, dim_out, time_emb_dim, groups=8, context_dim=512):
+    def __init__(
+        self, dim, dim_out, time_emb_dim, utt_emb_dim=512, norm_type="condgroupnorm"
+    ):
         super().__init__()
         self.mlp = torch.nn.Sequential(
-            nn.Mish(), torch.nn.Linear(time_emb_dim, dim_out)
+            nn.SiLU(), torch.nn.Linear(time_emb_dim, dim_out)
         )
 
-        self.block1 = Block1D(dim, dim_out, groups=groups, context_dim=context_dim)
-        self.block2 = Block1D(dim_out, dim_out, groups=groups, context_dim=context_dim)
+        self.block1 = Block1D(
+            dim, dim_out, utt_emb_dim=utt_emb_dim, norm_type=norm_type
+        )
+        self.block2 = Block1D(
+            dim_out, dim_out, utt_emb_dim=utt_emb_dim, norm_type=norm_type
+        )
 
         self.res_conv = (
             torch.nn.Conv1d(dim, dim_out, 1) if dim != dim_out else torch.nn.Identity()
@@ -232,53 +197,47 @@ class Decoder(nn.Module):
             input_channel = output_channel
             output_channel = channels[i]
             is_last = i == len(channels) - 1
-            resnet = ResnetBlock1D(
+            resnet_1 = ResnetBlock1D(
                 dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
             )
-            transformer_blocks = nn.ModuleList(
-                [
-                    BasicTransformerBlock(
-                        dim=output_channel,
-                        num_attention_heads=num_heads,
-                        attention_head_dim=attention_head_dim,
-                        dropout=dropout,
-                        activation_fn=act_fn,
-                    )
-                    for _ in range(n_blocks)
-                ]
+            resnet_2 = ResnetBlock1D(
+                dim=output_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
+            transformer_blocks = BasicTransformerBlock(
+                dim=output_channel,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                dropout=dropout,
+                activation_fn=act_fn,
             )
             downsample = (
-                Downsample1D(output_channel)
-                if not is_last
-                else nn.Conv1d(output_channel, output_channel, 3, padding=1)
+                Downsample1D(output_channel) if not is_last else torch.nn.Identity()
             )
 
             self.down_blocks.append(
-                nn.ModuleList([resnet, transformer_blocks, downsample])
+                nn.ModuleList([resnet_1, resnet_2, transformer_blocks, downsample])
             )
 
         for i in range(num_mid_blocks):
             input_channel = channels[-1]
             out_channels = channels[-1]
 
-            resnet = ResnetBlock1D(
+            resnet_1 = ResnetBlock1D(
                 dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
             )
-
-            transformer_blocks = nn.ModuleList(
-                [
-                    BasicTransformerBlock(
-                        dim=output_channel,
-                        num_attention_heads=num_heads,
-                        attention_head_dim=attention_head_dim,
-                        dropout=dropout,
-                        activation_fn=act_fn,
-                    )
-                    for _ in range(n_blocks)
-                ]
+            transformer_blocks = BasicTransformerBlock(
+                dim=output_channel,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                dropout=dropout,
+                activation_fn=act_fn,
             )
-
-            self.mid_blocks.append(nn.ModuleList([resnet, transformer_blocks]))
+            resnet_2 = ResnetBlock1D(
+                dim=output_channel, dim_out=output_channel, time_emb_dim=time_embed_dim
+            )
+            self.mid_blocks.append(
+                nn.ModuleList([resnet_1, transformer_blocks, resnet_2])
+            )
 
         channels = channels[::-1] + (channels[0],)
         for i in range(len(channels) - 1):
@@ -286,30 +245,32 @@ class Decoder(nn.Module):
             output_channel = channels[i + 1]
             is_last = i == len(channels) - 2
 
-            resnet = ResnetBlock1D(
+            resnet_1 = ResnetBlock1D(
                 dim=2 * input_channel,
                 dim_out=output_channel,
                 time_emb_dim=time_embed_dim,
             )
-            transformer_blocks = nn.ModuleList(
-                [
-                    BasicTransformerBlock(
-                        dim=output_channel,
-                        num_attention_heads=num_heads,
-                        attention_head_dim=attention_head_dim,
-                        dropout=dropout,
-                        activation_fn=act_fn,
-                    )
-                    for _ in range(n_blocks)
-                ]
+            resnet_2 = ResnetBlock1D(
+                dim=output_channel,
+                dim_out=output_channel,
+                time_emb_dim=time_embed_dim,
+            )
+            transformer_blocks = BasicTransformerBlock(
+                dim=output_channel,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                dropout=dropout,
+                activation_fn=act_fn,
             )
             upsample = (
                 Upsample1D(output_channel, use_conv_transpose=True)
                 if not is_last
-                else nn.Conv1d(output_channel, output_channel, 3, padding=1)
+                else torch.nn.Identity()
             )
 
-            self.up_blocks.append(nn.ModuleList([resnet, transformer_blocks, upsample]))
+            self.up_blocks.append(
+                nn.ModuleList([resnet_1, resnet_2, transformer_blocks, upsample])
+            )
 
         self.final_block = Block1D(channels[-1], channels[-1])
         self.final_proj = nn.Conv1d(channels[-1], self.out_channels, 1)
@@ -352,21 +313,21 @@ class Decoder(nn.Module):
         t = self.time_embeddings(t)
         t = self.time_mlp(t)
 
-        x = torch.cat([mu, x], 1)  # [B, 160, L]
+        x = pack([x, mu], "b * t")[0]
 
         hiddens = []
         masks = [mask]
-        for resnet, transformer_blocks, downsample in self.down_blocks:
+        for resnet1, resnet2, transformer_block, downsample in self.down_blocks:
             mask_down = masks[-1]
-            x = resnet(x, mask_down, t, spks)
+            x = resnet1(x, mask_down, t, spks)
+            x = resnet2(x, mask_down, t, spks)
             x = rearrange(x, "b c t -> b t c")
             mask_down = rearrange(mask_down, "b 1 t -> b t")
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=mask_down,
-                    timestep=t,
-                )
+            x = transformer_block(
+                hidden_states=x,
+                attention_mask=mask_down,
+                timestep=t,
+            )
             x = rearrange(x, "b t c -> b c t")
             mask_down = rearrange(mask_down, "b t -> b 1 t")
             hiddens.append(x)  # Save hidden states for skip connections
@@ -376,31 +337,30 @@ class Decoder(nn.Module):
         masks = masks[:-1]
         mask_mid = masks[-1]
 
-        for resnet, transformer_blocks in self.mid_blocks:
-            x = resnet(x, mask_mid, t, spks)
+        for resnet1, transformer_block, resnet2 in self.mid_blocks:
+            x = resnet1(x, mask_mid, t, spks)
             x = rearrange(x, "b c t -> b t c")
             mask_mid = rearrange(mask_mid, "b 1 t -> b t")
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=mask_mid,
-                    timestep=t,
-                )
+            x = transformer_block(
+                hidden_states=x,
+                attention_mask=mask_mid,
+                timestep=t,
+            )
             x = rearrange(x, "b t c -> b c t")
             mask_mid = rearrange(mask_mid, "b t -> b 1 t")
+            x = resnet2(x, mask_mid, t, spks)
 
-        for resnet, transformer_blocks, upsample in self.up_blocks:
+        for resnet1, resnet2, transformer_blocks, upsample in self.up_blocks:
             mask_up = masks.pop()
-            x = torch.cat((x, hiddens.pop()), dim=1)
-            x = resnet(x, mask_up, t, spks)
+            x = resnet1(pack([x, hiddens.pop()], "b * t")[0], mask_up, t, spks)
+            x = resnet2(x, mask_up, t, spks)
             x = rearrange(x, "b c t -> b t c")
             mask_up = rearrange(mask_up, "b 1 t -> b t")
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=mask_up,
-                    timestep=t,
-                )
+            x = transformer_blocks(
+                hidden_states=x,
+                attention_mask=mask_up,
+                timestep=t,
+            )
             x = rearrange(x, "b t c -> b c t")
             mask_up = rearrange(mask_up, "b t -> b 1 t")
             x = upsample(x * mask_up)

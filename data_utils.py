@@ -8,7 +8,7 @@ from torch.utils.data import WeightedRandomSampler
 
 import utils
 from modules.mel_processing import mel_spectrogram_torch
-from utils import audio_to_energy, load_filepaths_and_text, load_wav_to_torch
+from utils import load_filepaths_and_text, load_wav_to_torch, mel_to_energy
 
 # import h5py
 
@@ -94,19 +94,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             self.mel_fmin,
             self.mel_fmax,
         )
-        spec = torch.squeeze(spec, 0)
 
-        # energy
-        energy = audio_to_energy(
-            audio_norm,
-            self.filter_length,
-            self.num_mels,
-            self.sampling_rate,
-            self.hop_length,
-            self.win_length,
-            self.mel_fmin,
-            self.mel_fmax,
-        )
+        spec = torch.squeeze(spec, 0)
 
         # load f0 and uv
         f0_path = filename.replace(".wav", ".rmvpe.pt")
@@ -122,7 +111,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
 
         # perturbate c randomly with noise and weight randomly
-        if random.random() < 0.5:
+        if random.random() < 0.3:
             c = c + torch.randn_like(c)
 
         lmin = min(c.size(-1), spec.size(-1))
@@ -132,34 +121,32 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             filename,
         )
         assert abs(audio_norm.shape[1] - lmin * self.hop_length) < 3 * self.hop_length
-        spec, c, f0, uv, energy = (
+        spec, c, f0, uv = (
             spec[:, :lmin],
             c[:, :lmin],
             f0[:, :lmin],
             uv[:lmin],
-            energy[:, :lmin],
         )
         audio_norm = audio_norm[:, : lmin * self.hop_length]
 
         # speaker id
         speaker_id = torch.LongTensor([int(speaker_id)])
 
-        return c, f0, spec, audio_norm, uv, energy, speaker_id
+        return c, f0, spec, audio_norm, uv, speaker_id
 
-    def random_slice(self, c, f0, spec, audio_norm, uv, energy, speaker_id):
+    def random_slice(self, c, f0, spec, audio_norm, uv, speaker_id):
         if spec.shape[1] > self.num_frames:
             start = random.randint(0, spec.shape[1] - self.num_frames)
             end = start + self.num_frames - 1
-            spec, c, f0, uv, energy = (
+            spec, c, f0, uv = (
                 spec[:, start:end],
                 c[:, start:end],
                 f0[:, start:end],
                 uv[start:end],
-                energy[:, start:end],
             )
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
 
-        return c, f0, spec, audio_norm, uv, energy, speaker_id
+        return c, f0, spec, audio_norm, uv, speaker_id
 
     def __getitem__(self, index):
         if self.all_in_mem:
@@ -190,14 +177,12 @@ class TextAudioCollate:
         spec_padded = torch.FloatTensor(len(batch), batch[0][2].shape[0], max_c_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
         uv_padded = torch.FloatTensor(len(batch), max_c_len)
-        energy_padded = torch.FloatTensor(len(batch), 1, max_c_len)
 
         c_padded.zero_()
         spec_padded.zero_()
         f0_padded.zero_()
         wav_padded.zero_()
         uv_padded.zero_()
-        energy_padded.zero_()
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
@@ -218,10 +203,7 @@ class TextAudioCollate:
             uv = row[4]
             uv_padded[i, : uv.size(0)] = uv
 
-            energy = row[5]
-            energy_padded[i, 0, : energy.size(1)] = energy
-
-            sid[i] = row[6]
+            sid[i] = row[5]
 
         return (
             c_padded,
@@ -230,7 +212,6 @@ class TextAudioCollate:
             wav_padded,
             lengths,
             uv_padded,
-            energy_padded,
             sid,
         )
 
